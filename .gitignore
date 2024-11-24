@@ -1,0 +1,6 @@
+.env
+test.py
+dist/*
+build/*
+devbox.*
+*.spec
