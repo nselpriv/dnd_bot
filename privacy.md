@@ -1,5 +1,5 @@
 Privacy Policy
-Effective Date: [Insert Date]
+Effective Date: 26-11-2024
 
 1. Information We Collect
 The Bot may collect the following data during its operation:
