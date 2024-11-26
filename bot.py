@@ -13,6 +13,9 @@ GUILD = os.getenv('DISCORD_GUILD')
 
 intents = discord.Intents.default()
 intents.guilds = True
+intents.members = True 
+
+
 
 class MyBot(discord.Client):
     def __init__(self, *, intents: discord.Intents):
@@ -22,8 +25,7 @@ class MyBot(discord.Client):
 
     async def setup_hook(self):
 
-        g = discord.Object(id=503949236325580801)
-        await self.tree.sync(guild=g)
+        await self.tree.sync()
 
 client = MyBot(intents=intents)
 
@@ -160,12 +162,34 @@ async def clear_bot_posts(interaction: discord.Interaction):
         await interaction.response.send_message("No messages from the bot found in this channel.", ephemeral=True)
 
 # Gibberish message generator
-def gibberish_message(message: str) -> str:
-    return ''.join(random.choice(string.ascii_letters + string.digits) if random.random() < 0.7 else c for c in message)
+def obfuscate_message_full_mapping(message: str) -> str:
+    # Define a consistent character map (a "language translation")
+    char_map = {
+        'a': 'x', 'b': 'y', 'c': 'z', 'd': 'w', 'e': 'v',
+        'f': 'u', 'g': 't', 'h': 's', 'i': 'r', 'j': 'q',
+        'k': 'p', 'l': 'o', 'm': 'n', 'n': 'm', 'o': 'l',
+        'p': 'k', 'q': 'j', 'r': 'i', 's': 'h', 't': 'g',
+        'u': 'f', 'v': 'e', 'w': 'd', 'x': 'c', 'y': 'b', 'z': 'a',
+        'A': 'X', 'B': 'Y', 'C': 'Z', 'D': 'W', 'E': 'V',
+        'F': 'U', 'G': 'T', 'H': 'S', 'I': 'R', 'J': 'Q',
+        'K': 'P', 'L': 'O', 'M': 'N', 'N': 'M', 'O': 'L',
+        'P': 'K', 'Q': 'J', 'R': 'I', 'S': 'H', 'T': 'G',
+        'U': 'F', 'V': 'E', 'W': 'D', 'X': 'C', 'Y': 'B', 'Z': 'A',
+        '0': '9', '1': '8', '2': '7', '3': '6', '4': '5',
+        '5': '4', '6': '3', '7': '2', '8': '1', '9': '0',
+        # Leave punctuation and spaces as is
+        ' ': ' ', '!': '!', '.': '.', ',': ',', '?': '?',
+        ':': ':', ';': ';', '\'': '\'', '\"': '\"', '-': '-',
+    }
+
+    # Obfuscate each character
+    obfuscated_message = ''.join(char_map.get(c, c) for c in message)
+
+    return obfuscated_message
 
 # Dropdown select for languages
 class LanguageSelect(Select):
-    def __init__(self):
+    def __init__(self, content: str):
         # Options for the dropdown (languages)
         options = [
             discord.SelectOption(label="Undercommon", value="Undercommon"),
@@ -177,23 +201,28 @@ class LanguageSelect(Select):
             discord.SelectOption(label="Thieves' Cant", value="Thieves' Cant"),
             discord.SelectOption(label="Common Sign Language", value="Common Sign Language"),
             discord.SelectOption(label="Old Omuan", value="Old Omuan"),
-
         ]
         super().__init__(placeholder="Choose a language...", min_values=1, max_values=1, options=options)
-
+        self.content = content  # Store the secret message content
 
     async def callback(self, interaction: discord.Interaction):
+        # Defer the response immediately
+        await interaction.response.defer()
+
         language = self.values[0]  # Get selected language
-        content = self.message.content  # Get the message content (the secret message)
+        content = self.content  # Get the message content (the secret message)
 
         titl = f'{language} Message'
 
         # Send the message to the entire guild, checking the role of each member
         for member in interaction.guild.members:
+            print(member)
             required_role_name = language
             user_has_role = False
+            print(member.roles)
             
-            if("Spiller" not in member.roles):
+            # Check if the user has the "Spiller" role and required language role
+            if not any(role.name == "Spiller" or role.name == "Gm" for role in member.roles):
                 continue
 
             # Check if the user has the required role
@@ -205,8 +234,10 @@ class LanguageSelect(Select):
             # Prepare the message based on role
             if user_has_role:
                 message = f"**{content}**"  # Show original message if they have the role
+                titl = titl
             else:
-                message = gibberish_message(content)  # Show gibberish if they don't have the role
+                titl = "Unknown"
+                message = obfuscate_message_full_mapping(content)  # Show gibberish if they don't have the role
 
             # Send the personalized message
             embed = discord.Embed(
@@ -216,26 +247,26 @@ class LanguageSelect(Select):
             )
             try:
                 await member.send(embed=embed)  # Send the message via DM to each member
+                print(f'{message} sending to {member.global_name}')
             except discord.Forbidden:
                 # Handle case where DMs are disabled for a user
                 print(f"Couldn't DM {member.name}, they may have DMs disabled.")
         
-        # Acknowledge the command was executed
-        await interaction.response.send_message("The message has been sent to everyone in the guild (via DM).")
+        # Optionally send a follow-up message
+        await interaction.followup.send("The message has been sent to everyone in the guild (via DM).")
+
 
 # Command to post a secret message
 @client.tree.command(name="switch-language", description="Post a secret message that only specific users can read")
 async def reveal_message(interaction: discord.Interaction, content: str):
     # Create a dropdown view
     view = View(timeout=None)  # Set timeout as None for the dropdown to stay open
-    select = LanguageSelect()
+    select = LanguageSelect(content=content)  # Pass the content to the dropdown
     view.add_item(select)
 
-    # Set the content of the message to display in the dropdown
-    select.message = content  # Store the content on the select dropdown
-    
     # Send a prompt message to the channel with the dropdown
     await interaction.response.send_message("Choose a language to send the message in:", view=view)
+
 
 @client.event
 async def on_ready():
@@ -245,6 +276,11 @@ async def on_ready():
                 f'{client.user} is connected to the following guild:\n'
                 f'{guild.name} (id: {guild.id})'
             )
+            members = [member async for member in guild.fetch_members()]
+            print(f'Members in {guild.name}: {len(members)}')
+            for member in members:
+                print(f'- {member.name}#{member.discriminator}')
+
             break
     else:
         print(f"{client.user} is not connected to the specified guild: {GUILD}")
