@@ -22,13 +22,13 @@ intents = discord.Intents.default()
 intents.guilds = True
 intents.members = True
 intents.voice_states = True
-intents.message_content = True  # Needed for prefix commands if used
 
 class MyBot(discord.Client):
     def __init__(self, *, intents: discord.Intents):
         super().__init__(intents=intents)
         self.tree = discord.app_commands.CommandTree(self)
         self.audio_players = {}
+        self.views = {}  # Store persistent views per guild
 
     async def setup_hook(self):
         await self.tree.sync()
@@ -69,7 +69,7 @@ class AudioPlayer:
             }
             source = discord.FFmpegPCMAudio(url, **ffmpeg_options)
             if self.voice_client.is_playing() or self.voice_client.is_paused():
-                self.voice_client.stop()  # Stop only if something is playing
+                self.voice_client.stop()
             self.voice_client.play(source, after=lambda e: asyncio.run_coroutine_threadsafe(self.play_next(), client.loop))
             logger.info(f"Started playing: {title}")
             return title
@@ -79,17 +79,126 @@ class AudioPlayer:
             await self.play_next()
 
     def adjust_audio(self):
-        """Attempt to adjust audio without full restart if possible"""
+        """Apply volume/speed changes without interrupting playback"""
         if self.playing and not self.paused and self.voice_client and self.current_source:
-            logger.info(f"Attempting to adjust audio - Volume: {self.volume}, Speed: {self.speed}")
+            logger.info(f"Adjusting audio - Volume: {self.volume}, Speed: {self.speed}")
+            # Note: FFmpegPCMAudio doesn't support mid-stream changes well
+            # We'll re-queue the current track with new settings
             url, title, is_local = self.current_source
-            # Note: Real-time adjustment isn't supported well with FFmpegPCMAudio
-            # For now, we'll queue a restart with new settings
-            if self.voice_client.is_playing():
-                self.queue.appendleft((url, title, is_local))  # Re-queue current
-                self.voice_client.stop()
-                asyncio.run_coroutine_threadsafe(self.play_next(), client.loop)
-            logger.info(f"Audio adjustment queued for {title}")
+            self.queue.appendleft((url, title, is_local))
+            self.voice_client.stop()
+            asyncio.run_coroutine_threadsafe(self.play_next(), client.loop)
+
+class ControlPanelView(discord.ui.View):
+    def __init__(self, guild_id):
+        super().__init__(timeout=None)
+        self.guild_id = guild_id
+
+    @discord.ui.button(label="Play/Pause", style=discord.ButtonStyle.primary, custom_id="control_play_pause")
+    async def play_pause(self, interaction: discord.Interaction, button: discord.ui.Button):
+        player = client.get_audio_player(interaction.guild.id)
+        if not player.voice_client:
+            await interaction.response.send_message("I'm not in a voice channel!", ephemeral=True)
+            return
+
+        if player.paused:
+            player.voice_client.resume()
+            player.paused = False
+            await interaction.response.send_message("Audio resumed!")
+            logger.info(f"Resume button - Playing: {player.playing}, Paused: {player.paused}")
+        elif player.playing and not player.paused:
+            if player.voice_client.is_playing():
+                player.voice_client.pause()
+                player.paused = True
+                await interaction.response.send_message("Audio paused!")
+                logger.info(f"Pause button - Playing: {player.playing}, Paused: {player.paused}")
+            else:
+                await interaction.response.send_message("Nothing is currently playing!")
+        else:
+            await interaction.response.send_message("Nothing is playing to pause/resume!")
+
+    @discord.ui.button(label="Skip", style=discord.ButtonStyle.secondary, custom_id="control_skip")
+    async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
+        player = client.get_audio_player(interaction.guild.id)
+        if not player.voice_client:
+            await interaction.response.send_message("I'm not playing anything!", ephemeral=True)
+            return
+
+        if player.queue:
+            player.voice_client.stop()
+            await interaction.response.send_message("Skipped to next track!")
+        else:
+            await interaction.response.send_message("No more tracks in queue to skip to!")
+        logger.info(f"Skip button - Queue length: {len(player.queue)}")
+
+    @discord.ui.button(label="Stop", style=discord.ButtonStyle.danger, custom_id="control_stop")
+    async def stop(self, interaction: discord.Interaction, button: discord.ui.Button):
+        player = client.get_audio_player(interaction.guild.id)
+        if not player.voice_client:
+            await interaction.response.send_message("I'm not playing anything!", ephemeral=True)
+            return
+
+        player.voice_client.stop()
+        player.queue.clear()
+        player.current_source = None
+        player.playing = False
+        player.paused = False
+        await player.voice_client.disconnect()
+        player.voice_client = None
+        await interaction.response.send_message("Stopped audio and cleared the queue!")
+        logger.info("Stop button - Queue cleared")
+
+    @discord.ui.button(label="Vol Up", style=discord.ButtonStyle.green, custom_id="control_vol_up")
+    async def volume_up(self, interaction: discord.Interaction, button: discord.ui.Button):
+        player = client.get_audio_player(interaction.guild.id)
+        if not player.voice_client:
+            await interaction.response.send_message("I'm not playing anything!", ephemeral=True)
+            return
+
+        old_volume = player.volume
+        player.volume = min(1.0, player.volume + 0.1)
+        player.adjust_audio()
+        logger.info(f"Volume up button from {old_volume*100}% to {player.volume*100}% - Playing: {player.playing}, Paused: {player.paused}, Queue: {len(player.queue)}")
+        await interaction.response.send_message(f"Volume set to {player.volume * 100}%")
+
+    @discord.ui.button(label="Vol Down", style=discord.ButtonStyle.red, custom_id="control_vol_down")
+    async def volume_down(self, interaction: discord.Interaction, button: discord.ui.Button):
+        player = client.get_audio_player(interaction.guild.id)
+        if not player.voice_client:
+            await interaction.response.send_message("I'm not playing anything!", ephemeral=True)
+            return
+
+        old_volume = player.volume
+        player.volume = max(0.0, player.volume - 0.1)
+        player.adjust_audio()
+        logger.info(f"Volume down button from {old_volume*100}% to {player.volume*100}% - Playing: {player.playing}, Paused: {player.paused}, Queue: {len(player.queue)}")
+        await interaction.response.send_message(f"Volume set to {player.volume * 100}%")
+
+    @discord.ui.button(label="Speed Up", style=discord.ButtonStyle.green, custom_id="control_speed_up")
+    async def speed_up(self, interaction: discord.Interaction, button: discord.ui.Button):
+        player = client.get_audio_player(interaction.guild.id)
+        if not player.voice_client:
+            await interaction.response.send_message("I'm not playing anything!", ephemeral=True)
+            return
+
+        old_speed = player.speed
+        player.speed = min(2.0, player.speed + 0.1)
+        player.adjust_audio()
+        logger.info(f"Speed up button from {old_speed}x to {player.speed}x - Playing: {player.playing}, Paused: {player.paused}, Queue: {len(player.queue)}")
+        await interaction.response.send_message(f"Playback speed set to {player.speed}x")
+
+    @discord.ui.button(label="Speed Down", style=discord.ButtonStyle.red, custom_id="control_speed_down")
+    async def speed_down(self, interaction: discord.Interaction, button: discord.ui.Button):
+        player = client.get_audio_player(interaction.guild.id)
+        if not player.voice_client:
+            await interaction.response.send_message("I'm not playing anything!", ephemeral=True)
+            return
+
+        old_speed = player.speed
+        player.speed = max(0.5, player.speed - 0.1)
+        player.adjust_audio()
+        logger.info(f"Speed down button from {old_speed}x to {player.speed}x - Playing: {player.playing}, Paused: {player.paused}, Queue: {len(player.queue)}")
+        await interaction.response.send_message(f"Playback speed set to {player.speed}x")
 
 class SoundboardSelect(discord.ui.Select):
     def __init__(self):
@@ -127,6 +236,19 @@ class SoundboardSelect(discord.ui.Select):
         else:
             await interaction.followup.send(f"Added to queue: **{title}** (Position: {len(player.queue)})")
         logger.info(f"Added to queue: {title}")
+
+class SoundboardView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(SoundboardSelect())
+
+@client.tree.command(name="control", description="Show the control panel for the music bot")
+async def control(interaction: discord.Interaction):
+    guild_id = interaction.guild.id
+    view = ControlPanelView(guild_id)
+    client.views[guild_id] = view  # Store the view for persistence
+    embed = discord.Embed(title="Music Bot Control Panel", description="Use the buttons below to control the bot!", color=discord.Color.blue())
+    await interaction.response.send_message(embed=embed, view=view)
 
 @client.tree.command(name="play-youtube", description="Play audio from YouTube")
 async def play_youtube(interaction: discord.Interaction, url: str):
@@ -190,11 +312,6 @@ async def soundboard(interaction: discord.Interaction):
     view = SoundboardView()
     await interaction.response.send_message("Select a sound:", view=view, ephemeral=True)
 
-class SoundboardView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-        self.add_item(SoundboardSelect())
-
 async def get_youtube_audio_url(youtube_url):
     ydl_opts = {
         'format': 'bestaudio/best',
@@ -220,100 +337,13 @@ async def queue(interaction: discord.Interaction):
         embed.add_field(name=f"{i}.", value=title, inline=False)
     await interaction.response.send_message(embed=embed)
 
-@client.tree.command(name="volume", description="Set the audio volume (0.0 to 1.0)")
-async def volume(interaction: discord.Interaction, volume: float):
-    if volume < 0.0 or volume > 1.0:
-        await interaction.response.send_message("Volume must be between 0.0 and 1.0!", ephemeral=True)
-        return
-    
-    player = client.get_audio_player(interaction.guild.id)
-    if not player.voice_client:
-        await interaction.response.send_message("I'm not playing anything!")
-        return
-    
-    old_volume = player.volume
-    player.volume = volume
-    player.adjust_audio()
-    logger.info(f"Volume changed from {old_volume*100}% to {volume*100}% - Playing: {player.playing}, Paused: {player.paused}, Queue: {len(player.queue)}")
-    await interaction.response.send_message(f"Volume set to {volume * 100}%")
-
-@client.tree.command(name="speed", description="Set playback speed (0.5 to 2.0)")
-async def speed(interaction: discord.Interaction, speed: float):
-    if speed < 0.5 or speed > 2.0:
-        await interaction.response.send_message("Speed must be between 0.5 and 2.0!", ephemeral=True)
-        return
-    
-    player = client.get_audio_player(interaction.guild.id)
-    if not player.voice_client:
-        await interaction.response.send_message("I'm not playing anything!")
-        return
-    
-    old_speed = player.speed
-    player.speed = speed
-    player.adjust_audio()
-    logger.info(f"Speed changed from {old_speed}x to {speed}x - Playing: {player.playing}, Paused: {player.paused}, Queue: {len(player.queue)}")
-    await interaction.response.send_message(f"Playback speed set to {speed}x")
-
-@client.tree.command(name="skip", description="Skip to the next audio")
-async def skip(interaction: discord.Interaction):
-    player = client.get_audio_player(interaction.guild.id)
-    if not player.voice_client:
-        await interaction.response.send_message("I'm not playing anything!")
-        return
-    
-    if player.queue:
-        player.voice_client.stop()  # This will trigger play_next
-        await interaction.response.send_message("Skipped to next track!")
-    else:
-        await interaction.response.send_message("No more tracks in queue to skip to!")
-    logger.info(f"Skip command executed - Queue length: {len(player.queue)}")
-
-@client.tree.command(name="pause", description="Pause the current audio")
-async def pause(interaction: discord.Interaction):
-    player = client.get_audio_player(interaction.guild.id)
-    if not player.voice_client or not player.playing or player.paused:
-        await interaction.response.send_message("Nothing is playing or already paused!")
-        return
-    
-    if player.voice_client.is_playing():
-        player.voice_client.pause()
-        player.paused = True
-        await interaction.response.send_message("Audio paused!")
-    else:
-        await interaction.response.send_message("Nothing is currently playing!")
-    logger.info(f"Pause command - Playing: {player.playing}, Paused: {player.paused}")
-
-@client.tree.command(name="resume", description="Resume paused audio")
-async def resume(interaction: discord.Interaction):
-    player = client.get_audio_player(interaction.guild.id)
-    if not player.voice_client or not player.paused:
-        await interaction.response.send_message("Nothing is paused!")
-        return
-    
-    player.voice_client.resume()
-    player.paused = False
-    await interaction.response.send_message("Audio resumed!")
-    logger.info(f"Resume command - Playing: {player.playing}, Paused: {player.paused}")
-
-@client.tree.command(name="stop", description="Stop audio and clear the queue")
-async def stop(interaction: discord.Interaction):
-    player = client.get_audio_player(interaction.guild.id)
-    if not player.voice_client:
-        await interaction.response.send_message("I'm not playing anything!")
-        return
-    
-    player.voice_client.stop()
-    player.queue.clear()
-    player.current_source = None
-    player.playing = False
-    player.paused = False
-    await player.voice_client.disconnect()
-    player.voice_client = None
-    await interaction.response.send_message("Stopped audio and cleared the queue!")
-    logger.info("Stop command executed - Queue cleared")
-
 @client.event
 async def on_ready():
     print(f'{client.user} has connected to Discord!')
+    # Add persistent views on startup
+    for guild in client.guilds:
+        client.views[guild.id] = ControlPanelView(guild.id)
+    for view in client.views.values():
+        client.add_view(view)
 
 client.run(TOKEN)
