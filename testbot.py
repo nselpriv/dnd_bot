@@ -62,14 +62,22 @@ class AudioPlayer:
         self.paused = False
         url, title, is_local = self.queue.popleft()
         self.current_source = (url, title, is_local)
-        logger.info(f"Playing next: {title} (URL: {url}, Local: {is_local})")
+        logger.info(f"Playing next: {title} (URL/Path: {url}, Local: {is_local})")
 
         try:
             if self.ffmpeg_process:
                 self.ffmpeg_process.terminate()
                 self.ffmpeg_process = None
 
-            stream = ffmpeg.input(url, reconnect=1, reconnect_streamed=1, reconnect_delay_max=5 if not is_local else None)
+            if is_local:
+                absolute_path = os.path.abspath(url)
+                logger.info(f"Resolved local file path: {absolute_path}")
+                if not os.path.exists(absolute_path):
+                    raise FileNotFoundError(f"Local file not found: {absolute_path}")
+                stream = ffmpeg.input(absolute_path)
+            else:
+                stream = ffmpeg.input(url, reconnect=1, reconnect_streamed=1, reconnect_delay_max=5)
+
             stream = ffmpeg.filter(stream, 'volume', volume=self.volume)
             stream = ffmpeg.filter(stream, 'atempo', tempo=self.speed)
             stream = ffmpeg.output(stream, 'pipe:', format='s16le', acodec='pcm_s16le', ac=2, ar=48000)
@@ -80,20 +88,86 @@ class AudioPlayer:
             logger.info(f"Started playing: {title}")
             return title
         except Exception as e:
-            logger.error(f"Error playing audio: {e}")
+            logger.error(f"Error playing audio: {e}", exc_info=True)
             self.playing = False
             await self.play_next()
 
-    def adjust_audio(self):
-        """Apply volume/speed changes to the current stream with error handling"""
-        if self.playing and not self.paused and self.voice_client and self.current_source and self.ffmpeg_process:
-            logger.info(f"Adjusting audio - Volume: {self.volume}, Speed: {self.speed}")
-            try:
-                self.ffmpeg_process.terminate()  # Stop current process
-                asyncio.run_coroutine_threadsafe(self.play_next(), client.loop)  # Restart with new settings
-            except Exception as e:
-                logger.error(f"Failed to adjust audio: {e}")
-                self.playing = False  # Reset state on failure
+    async def play_immediate(self, url, title, is_local):
+        """Play a sound immediately, interrupting current playback and clearing the queue."""
+        if not self.voice_client:
+            logger.info("No voice client available for immediate play.")
+            return
+
+        # Stop current playback and clear queue
+        if self.playing and self.voice_client.is_playing():
+            self.voice_client.stop()
+        if self.ffmpeg_process:
+            self.ffmpeg_process.terminate()
+            self.ffmpeg_process = None
+        self.queue.clear()  # Clear any pending items
+        self.paused = False
+
+        # Set up new playback
+        self.playing = True
+        self.current_source = (url, title, is_local)
+        logger.info(f"Playing immediately: {title} (URL/Path: {url}, Local: {is_local})")
+
+        try:
+            if is_local:
+                absolute_path = os.path.abspath(url)
+                logger.info(f"Resolved local file path: {absolute_path}")
+                if not os.path.exists(absolute_path):
+                    raise FileNotFoundError(f"Local file not found: {absolute_path}")
+                stream = ffmpeg.input(absolute_path)
+            else:
+                stream = ffmpeg.input(url, reconnect=1, reconnect_streamed=1, reconnect_delay_max=5)
+
+            stream = ffmpeg.filter(stream, 'volume', volume=self.volume)
+            stream = ffmpeg.filter(stream, 'atempo', tempo=self.speed)
+            stream = ffmpeg.output(stream, 'pipe:', format='s16le', acodec='pcm_s16le', ac=2, ar=48000)
+            self.ffmpeg_process = ffmpeg.run_async(stream, pipe_stdout=True, pipe_stderr=True)
+
+            source = discord.PCMAudio(self.ffmpeg_process.stdout)
+            self.voice_client.play(source, after=lambda e: asyncio.run_coroutine_threadsafe(self.play_next(), client.loop))
+            logger.info(f"Started playing immediately: {title}")
+        except Exception as e:
+            logger.error(f"Error playing immediate audio: {e}", exc_info=True)
+            self.playing = False
+
+    async def adjust_audio(self):
+        """Restart the current audio with updated volume/speed settings."""
+        if not self.playing or self.paused or not self.voice_client or not self.current_source:
+            return
+
+        url, title, is_local = self.current_source
+        logger.info(f"Adjusting audio - Volume: {self.volume}, Speed: {self.speed} for {title}")
+
+        try:
+            if self.ffmpeg_process:
+                self.ffmpeg_process.terminate()
+                self.ffmpeg_process = None
+
+            if is_local:
+                absolute_path = os.path.abspath(url)
+                logger.info(f"Adjusting local file path: {absolute_path}")
+                if not os.path.exists(absolute_path):
+                    raise FileNotFoundError(f"Local file not found: {absolute_path}")
+                stream = ffmpeg.input(absolute_path)
+            else:
+                stream = ffmpeg.input(url, reconnect=1, reconnect_streamed=1, reconnect_delay_max=5)
+
+            stream = ffmpeg.filter(stream, 'volume', volume=self.volume)
+            stream = ffmpeg.filter(stream, 'atempo', tempo=self.speed)
+            stream = ffmpeg.output(stream, 'pipe:', format='s16le', acodec='pcm_s16le', ac=2, ar=48000)
+            self.ffmpeg_process = ffmpeg.run_async(stream, pipe_stdout=True, pipe_stderr=True)
+
+            source = discord.PCMAudio(self.ffmpeg_process.stdout)
+            self.voice_client.stop()
+            self.voice_client.play(source, after=lambda e: asyncio.run_coroutine_threadsafe(self.play_next(), client.loop))
+            logger.info(f"Restarted audio with new settings: {title}")
+        except Exception as e:
+            logger.error(f"Failed to adjust audio: {e}", exc_info=True)
+            self.playing = False
 
     def cleanup(self):
         if self.ffmpeg_process:
@@ -142,24 +216,22 @@ class DirectMusicLinkModal(discord.ui.Modal, title="Direct Music Link"):
 
         url = self.url_input.value.strip()
         if url:
-            title = f"Direct Audio ({url})"  # Include the URL in the title for queue display
+            title = f"Direct Audio ({url})"
             is_local = False
             player.queue.append((url, title, is_local))
             if not player.playing:
                 await player.play_next()
             logger.info(f"Added to queue via modal: {title}")
 
-class SoundboardSelect(discord.ui.Select):
+class SoundboardView(discord.ui.View):
     def __init__(self):
-        options = [
-            discord.SelectOption(label="Airhorn", value="airhorn.mp3"),
-            discord.SelectOption(label="Tada", value="tada.mp3"),
-            discord.SelectOption(label="Crickets", value="crickets.mp3"),
-            discord.SelectOption(label="Rimshot", value="rimshot.mp3"),
-        ]
-        super().__init__(placeholder="Choose a sound", min_values=1, max_values=1, options=options)
+        super().__init__(timeout=None)
 
-    async def callback(self, interaction: discord.Interaction):
+    @discord.ui.button(label="Deja-vu", style=discord.ButtonStyle.blurple, custom_id="sound_Deja-vu")
+    async def Deja_vu_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.play_sound(interaction, "./music/deja-vu.mp3", "Deja-vu")
+
+    async def play_sound(self, interaction: discord.Interaction, sound_file: str, title: str):
         await interaction.response.defer()
         
         guild_id = interaction.guild.id
@@ -168,21 +240,9 @@ class SoundboardSelect(discord.ui.Select):
         if not player.voice_client and interaction.user.voice and interaction.user.voice.channel:
             player.voice_client = await interaction.user.voice.channel.connect()
 
-        sound_file = self.values[0]
-        audio_url = sound_file
-        title = sound_file.split('.')[0]
-        is_local = True
-        
-        player.queue.append((audio_url, title, is_local))
-        
-        if not player.playing:
-            await player.play_next()
-        logger.info(f"Added to queue: {title}")
-
-class SoundboardView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-        self.add_item(SoundboardSelect())
+        # Play the sound immediately, interrupting current playback
+        await player.play_immediate(sound_file, title, is_local=True)
+        logger.info(f"Played immediately from soundboard: {title}")
 
 class ControlPanelView(discord.ui.View):
     def __init__(self, guild_id):
@@ -202,7 +262,7 @@ class ControlPanelView(discord.ui.View):
     @discord.ui.button(label="Open Soundboard", style=discord.ButtonStyle.green, custom_id="control_open_soundboard", row=0)
     async def open_soundboard(self, interaction: discord.Interaction, button: discord.ui.Button):
         view = SoundboardView()
-        await interaction.response.send_message("Select a sound:", view=view, ephemeral=True)
+        await interaction.response.send_message("Soundboard:", view=view, ephemeral=True)
 
     @discord.ui.button(label="Show Queue", style=discord.ButtonStyle.secondary, custom_id="control_show_queue", row=1)
     async def show_queue(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -223,9 +283,10 @@ class ControlPanelView(discord.ui.View):
     async def play_pause(self, interaction: discord.Interaction, button: discord.ui.Button):
         player = client.get_audio_player(interaction.guild.id)
         if not player.voice_client:
+            await interaction.response.send_message("Not connected to a voice channel!", ephemeral=True)
             return
 
-        await asyncio.sleep(0.1)  # Small delay to ensure state update
+        await asyncio.sleep(0.1)
         if player.paused:
             player.voice_client.resume()
             player.paused = False
@@ -240,59 +301,71 @@ class ControlPanelView(discord.ui.View):
             await player.play_next()
             button.label = "Pause"
             logger.info(f"Play button - Starting next in queue")
-        await interaction.response.edit_message(view=self)  # Update the view to reflect label change
+        await interaction.response.edit_message(view=self)
 
     @discord.ui.button(label="Skip", style=discord.ButtonStyle.secondary, custom_id="control_skip", row=1)
     async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
         player = client.get_audio_player(interaction.guild.id)
         if not player.voice_client or not player.queue:
+            await interaction.response.send_message("Nothing to skip!", ephemeral=True)
             return
         player.voice_client.stop()
         logger.info(f"Skip button - Queue length: {len(player.queue)}")
+        await interaction.response.defer()
 
     @discord.ui.button(label="Stop", style=discord.ButtonStyle.danger, custom_id="control_stop", row=2)
     async def stop(self, interaction: discord.Interaction, button: discord.ui.Button):
         player = client.get_audio_player(interaction.guild.id)
         if not player.voice_client:
+            await interaction.response.send_message("Not connected to a voice channel!", ephemeral=True)
             return
         player.cleanup()
         logger.info("Stop button - Playback stopped and queue cleared.")
+        await interaction.response.defer()
 
     @discord.ui.button(label="Vol +", style=discord.ButtonStyle.green, custom_id="control_vol_up", row=3)
     async def volume_up(self, interaction: discord.Interaction, button: discord.ui.Button):
         player = client.get_audio_player(interaction.guild.id)
         if not player.voice_client:
+            await interaction.response.send_message("Not connected to a voice channel!", ephemeral=True)
             return
         player.volume = min(1.0, player.volume + 0.1)
-        player.adjust_audio()
-        logger.info(f"Volume up button to {player.volume*100}% - Playing: {player.playing}, Paused: {player.paused}")
+        await player.adjust_audio()
+        logger.info(f"Volume up to {player.volume*100}% - Playing: {player.playing}, Paused: {player.paused}")
+        await interaction.response.send_message(f"Volume increased to {int(player.volume * 100)}%", ephemeral=True)
 
     @discord.ui.button(label="Vol -", style=discord.ButtonStyle.red, custom_id="control_vol_down", row=3)
     async def volume_down(self, interaction: discord.Interaction, button: discord.ui.Button):
         player = client.get_audio_player(interaction.guild.id)
         if not player.voice_client:
+            await interaction.response.send_message("Not connected to a voice channel!", ephemeral=True)
             return
         player.volume = max(0.0, player.volume - 0.1)
-        player.adjust_audio()
-        logger.info(f"Volume down button to {player.volume*100}% - Playing: {player.playing}, Paused: {player.paused}")
+        await player.adjust_audio()
+        logger.info(f"Volume down to {player.volume*100}% - Playing: {player.playing}, Paused: {player.paused}")
+        await interaction.response.send_message(f"Volume decreased to {int(player.volume * 100)}%", ephemeral=True)
 
     @discord.ui.button(label="Speed +", style=discord.ButtonStyle.green, custom_id="control_speed_up", row=4)
     async def speed_up(self, interaction: discord.Interaction, button: discord.ui.Button):
         player = client.get_audio_player(interaction.guild.id)
         if not player.voice_client:
+            await interaction.response.send_message("Not connected to a voice channel!", ephemeral=True)
             return
         player.speed = min(2.0, player.speed + 0.1)
-        player.adjust_audio()
-        logger.info(f"Speed up button to {player.speed}x - Playing: {player.playing}, Paused: {player.paused}")
+        await player.adjust_audio()
+        logger.info(f"Speed up to {player.speed}x - Playing: {player.playing}, Paused: {player.paused}")
+        await interaction.response.send_message(f"Speed increased to {player.speed:.1f}x", ephemeral=True)
 
     @discord.ui.button(label="Speed -", style=discord.ButtonStyle.red, custom_id="control_speed_down", row=4)
     async def speed_down(self, interaction: discord.Interaction, button: discord.ui.Button):
         player = client.get_audio_player(interaction.guild.id)
         if not player.voice_client:
+            await interaction.response.send_message("Not connected to a voice channel!", ephemeral=True)
             return
         player.speed = max(0.5, player.speed - 0.1)
-        player.adjust_audio()
-        logger.info(f"Speed down button to {player.speed}x - Playing: {player.playing}, Paused: {player.paused}")
+        await player.adjust_audio()
+        logger.info(f"Speed down to {player.speed}x - Playing: {player.playing}, Paused: {player.paused}")
+        await interaction.response.send_message(f"Speed decreased to {player.speed:.1f}x", ephemeral=True)
 
 @client.tree.command(name="control", description="Show the control panel for the music bot")
 async def control(interaction: discord.Interaction):
@@ -359,10 +432,10 @@ async def play_url(interaction: discord.Interaction, url: str):
         await interaction.followup.send(f"Added to queue: **{title}** (Position: {len(player.queue)})")
     logger.info(f"Added to queue: {title}")
 
-@client.tree.command(name="soundboard", description="Play a sound from the soundboard")
+@client.tree.command(name="soundboard", description="Open the soundboard with buttons")
 async def soundboard(interaction: discord.Interaction):
     view = SoundboardView()
-    await interaction.response.send_message("Select a sound:", view=view, ephemeral=True)
+    await interaction.response.send_message("Soundboard:", view=view, ephemeral=True)
 
 async def get_youtube_audio_url(youtube_url):
     ydl_opts = {
