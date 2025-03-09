@@ -19,6 +19,22 @@ intents.guilds = True
 intents.members = True
 intents.voice_states = True
 
+class MyBot(discord.Client):
+    def __init__(self, *, intents: discord.Intents):
+        super().__init__(intents=intents)
+        self.tree = discord.app_commands.CommandTree(self)
+        self.audio_players = {}
+
+    async def setup_hook(self):
+        await self.tree.sync()
+
+    def get_audio_player(self, guild_id):
+        if guild_id not in self.audio_players:
+            self.audio_players[guild_id] = AudioPlayer()
+        return self.audio_players[guild_id]
+
+client = MyBot(intents=intents)
+
 class AudioPlayer:
     def __init__(self):
         self.queue = deque()
@@ -47,16 +63,31 @@ class AudioPlayer:
         self.voice_client.play(source, after=lambda e: asyncio.run_coroutine_threadsafe(self.play_next(), client.loop))
         return title
 
-class PlayModal(discord.ui.Modal, title="Choose Audio Source"):
-    source_type = discord.ui.Select(
-        placeholder="Select source type",
-        options=[
-            discord.SelectOption(label="YouTube", value="youtube"),
-            discord.SelectOption(label="Direct URL", value="url"),
-            discord.SelectOption(label="Local File", value="local")
+class SourceSelect(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(label="YouTube", value="youtube", description="Play from a YouTube URL"),
+            discord.SelectOption(label="Direct URL", value="url", description="Play from a direct audio URL"),
+            discord.SelectOption(label="Local File", value="local", description="Play a local audio file")
         ]
-    )
-    source_input = discord.ui.TextInput(label="Enter URL or File Name", placeholder="e.g., https://youtube.com/... or sound.mp3")
+        super().__init__(placeholder="Choose source type", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        self.view.source_type = self.values[0]
+        modal = PlayModal()
+        await interaction.response.send_modal(modal)
+
+class SourceView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.source_type = None
+        self.add_item(SourceSelect())
+
+class PlayModal(discord.ui.Modal, title="Enter Audio Source"):
+    source_input = discord.ui.TextInput(label="Enter URL or File Name", placeholder="e.g., https://youtube.com/... or sound.mp3", required=True)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer()
@@ -71,8 +102,8 @@ class PlayModal(discord.ui.Modal, title="Choose Audio Source"):
         if not player.voice_client:
             player.voice_client = await interaction.user.voice.channel.connect()
 
-        source_type = self.source_type.values[0]
         source = self.source_input.value
+        source_type = interaction.message.interaction.view.source_type  # Get source type from the view
 
         if source_type == "youtube":
             audio_url, title = await get_youtube_audio_url(source)
@@ -95,21 +126,10 @@ class PlayModal(discord.ui.Modal, title="Choose Audio Source"):
         else:
             await interaction.followup.send(f"Added to queue: **{title}** (Position: {len(player.queue)})")
 
-class MyBot(discord.Client):
-    def __init__(self, *, intents: discord.Intents):
-        super().__init__(intents=intents)
-        self.tree = discord.app_commands.CommandTree(self)
-        self.audio_players = {}
-
-    async def setup_hook(self):
-        await self.tree.sync()
-
-    def get_audio_player(self, guild_id):
-        if guild_id not in self.audio_players:
-            self.audio_players[guild_id] = AudioPlayer()
-        return self.audio_players[guild_id]
-
-client = MyBot(intents=intents)
+@client.tree.command(name="play", description="Play audio from various sources")
+async def play(interaction: discord.Interaction):
+    view = SourceView()
+    await interaction.response.send_message("Select a source type:", view=view, ephemeral=True)
 
 async def get_youtube_audio_url(youtube_url):
     ydl_opts = {
@@ -120,14 +140,6 @@ async def get_youtube_audio_url(youtube_url):
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(youtube_url, download=False)
         return info['url'], info.get('title', 'Unknown Title')
-
-@client.tree.command(name="play", description="Play audio from various sources")
-async def play(interaction: discord.Interaction):
-    modal = PlayModal()
-    modal.source_type.placeholder = "Select source type"
-    view = discord.ui.View()
-    view.add_item(modal.source_type)
-    await interaction.response.send_modal(modal)
 
 @client.tree.command(name="queue", description="View the current audio queue")
 async def queue(interaction: discord.Interaction):
