@@ -5,7 +5,11 @@ import yt_dlp
 from dotenv import load_dotenv
 import os
 from collections import deque
-import random
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("discord_bot")
 
 discord.opus.load_opus('/lib/x86_64-linux-gnu/libopus.so.0')
 print(discord.opus.is_loaded())
@@ -18,6 +22,7 @@ intents = discord.Intents.default()
 intents.guilds = True
 intents.members = True
 intents.voice_states = True
+intents.message_content = True  # Needed for prefix commands if used
 
 class MyBot(discord.Client):
     def __init__(self, *, intents: discord.Intents):
@@ -48,76 +53,72 @@ class AudioPlayer:
     async def play_next(self):
         if not self.queue or not self.voice_client:
             self.playing = False
-            return  # Don't disconnect, just stop playing
+            logger.info("Queue empty or no voice client, stopping playback.")
+            return
 
         self.playing = True
         self.paused = False
         url, title, is_local = self.queue.popleft()
         self.current_source = (url, title, is_local)
+        logger.info(f"Playing next: {title} (URL: {url}, Local: {is_local})")
 
-        ffmpeg_options = {
-            'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5' if not is_local else '',
-            'options': f'-vn -filter:a "volume={self.volume},atempo={self.speed}"'
-        }
-        source = discord.FFmpegPCMAudio(url, **ffmpeg_options)
-        self.voice_client.play(source, after=lambda e: asyncio.run_coroutine_threadsafe(self.play_next(), client.loop))
-        return title
+        try:
+            ffmpeg_options = {
+                'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5' if not is_local else '',
+                'options': f'-vn -filter:a "volume={self.volume},atempo={self.speed}"'
+            }
+            source = discord.FFmpegPCMAudio(url, **ffmpeg_options)
+            if self.voice_client.is_playing() or self.voice_client.is_paused():
+                self.voice_client.stop()  # Stop only if something is playing
+            self.voice_client.play(source, after=lambda e: asyncio.run_coroutine_threadsafe(self.play_next(), client.loop))
+            logger.info(f"Started playing: {title}")
+            return title
+        except Exception as e:
+            logger.error(f"Error playing audio: {e}")
+            self.playing = False
+            await self.play_next()
 
-class SourceSelect(discord.ui.Select):
+    def adjust_audio(self):
+        """Attempt to adjust audio without full restart if possible"""
+        if self.playing and not self.paused and self.voice_client and self.current_source:
+            logger.info(f"Attempting to adjust audio - Volume: {self.volume}, Speed: {self.speed}")
+            url, title, is_local = self.current_source
+            # Note: Real-time adjustment isn't supported well with FFmpegPCMAudio
+            # For now, we'll queue a restart with new settings
+            if self.voice_client.is_playing():
+                self.queue.appendleft((url, title, is_local))  # Re-queue current
+                self.voice_client.stop()
+                asyncio.run_coroutine_threadsafe(self.play_next(), client.loop)
+            logger.info(f"Audio adjustment queued for {title}")
+
+class SoundboardSelect(discord.ui.Select):
     def __init__(self):
         options = [
-            discord.SelectOption(label="YouTube", value="youtube", description="Play from a YouTube URL"),
-            discord.SelectOption(label="Direct URL", value="url", description="Play from a direct audio URL"),
-            discord.SelectOption(label="Local File", value="local", description="Play a local audio file")
+            discord.SelectOption(label="Airhorn", value="airhorn.mp3"),
+            discord.SelectOption(label="Tada", value="tada.mp3"),
+            discord.SelectOption(label="Crickets", value="crickets.mp3"),
+            discord.SelectOption(label="Rimshot", value="rimshot.mp3"),
         ]
-        super().__init__(placeholder="Choose source type", min_values=1, max_values=1, options=options)
+        super().__init__(placeholder="Choose a sound", min_values=1, max_values=1, options=options)
 
     async def callback(self, interaction: discord.Interaction):
-        self.view.source_type = self.values[0]
-        modal = PlayModal()
-        await interaction.response.send_modal(modal)
-
-class SourceView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-        self.source_type = None
-        self.add_item(SourceSelect())
-
-class PlayModal(discord.ui.Modal, title="Enter Audio Source"):
-    source_input = discord.ui.TextInput(label="Enter URL or File Name", placeholder="e.g., https://youtube.com/... or sound.mp3", required=True)
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-    async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer()
         
         if not interaction.user.voice or not interaction.user.voice.channel:
             await interaction.followup.send("Join a voice channel first!")
             return
-        
+
         guild_id = interaction.guild.id
         player = client.get_audio_player(guild_id)
         
         if not player.voice_client:
             player.voice_client = await interaction.user.voice.channel.connect()
-
-        source = self.source_input.value
-        source_type = interaction.message.interaction.view.source_type  # Get source type from the view
-
-        if source_type == "youtube":
-            audio_url, title = await get_youtube_audio_url(source)
-            is_local = False
-        elif source_type == "url":
-            audio_url, title = source, "Direct Audio"
-            is_local = False
-        elif source_type == "local":
-            if not os.path.exists(source):
-                await interaction.followup.send("Local file not found!")
-                return
-            audio_url, title = source, os.path.basename(source)
-            is_local = True
-
+        
+        sound_file = self.values[0]
+        audio_url = sound_file
+        title = sound_file.split('.')[0]
+        is_local = True
+        
         player.queue.append((audio_url, title, is_local))
         
         if not player.playing:
@@ -125,11 +126,74 @@ class PlayModal(discord.ui.Modal, title="Enter Audio Source"):
             await interaction.followup.send(f"Now playing: **{next_title}**")
         else:
             await interaction.followup.send(f"Added to queue: **{title}** (Position: {len(player.queue)})")
+        logger.info(f"Added to queue: {title}")
 
-@client.tree.command(name="play", description="Play audio from various sources")
-async def play(interaction: discord.Interaction):
-    view = SourceView()
-    await interaction.response.send_message("Select a source type:", view=view, ephemeral=True)
+@client.tree.command(name="play-youtube", description="Play audio from YouTube")
+async def play_youtube(interaction: discord.Interaction, url: str):
+    await interaction.response.defer()
+    
+    if not interaction.user.voice or not interaction.user.voice.channel:
+        await interaction.followup.send("Join a voice channel first!")
+        return
+    
+    guild_id = interaction.guild.id
+    player = client.get_audio_player(guild_id)
+    
+    if not player.voice_client:
+        player.voice_client = await interaction.user.voice.channel.connect()
+    
+    try:
+        audio_url, title = await get_youtube_audio_url(url)
+        is_local = False
+    except Exception as e:
+        await interaction.followup.send(f"Error processing YouTube URL: {str(e)}")
+        return
+    
+    player.queue.append((audio_url, title, is_local))
+    
+    if not player.playing:
+        next_title = await player.play_next()
+        await interaction.followup.send(f"Now playing: **{next_title}**")
+    else:
+        await interaction.followup.send(f"Added to queue: **{title}** (Position: {len(player.queue)})")
+    logger.info(f"Added to queue: {title}")
+
+@client.tree.command(name="play-url", description="Play audio from a direct URL")
+async def play_url(interaction: discord.Interaction, url: str):
+    await interaction.response.defer()
+    
+    if not interaction.user.voice or not interaction.user.voice.channel:
+        await interaction.followup.send("Join a voice channel first!")
+        return
+    
+    guild_id = interaction.guild.id
+    player = client.get_audio_player(guild_id)
+    
+    if not player.voice_client:
+        player.voice_client = await interaction.user.voice.channel.connect()
+    
+    audio_url = url
+    title = "Direct Audio"
+    is_local = False
+    
+    player.queue.append((audio_url, title, is_local))
+    
+    if not player.playing:
+        next_title = await player.play_next()
+        await interaction.followup.send(f"Now playing: **{next_title}**")
+    else:
+        await interaction.followup.send(f"Added to queue: **{title}** (Position: {len(player.queue)})")
+    logger.info(f"Added to queue: {title}")
+
+@client.tree.command(name="soundboard", description="Play a sound from the soundboard")
+async def soundboard(interaction: discord.Interaction):
+    view = SoundboardView()
+    await interaction.response.send_message("Select a sound:", view=view, ephemeral=True)
+
+class SoundboardView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(SoundboardSelect())
 
 async def get_youtube_audio_url(youtube_url):
     ydl_opts = {
@@ -167,10 +231,10 @@ async def volume(interaction: discord.Interaction, volume: float):
         await interaction.response.send_message("I'm not playing anything!")
         return
     
+    old_volume = player.volume
     player.volume = volume
-    if player.playing and not player.paused:
-        player.voice_client.stop()
-        await player.play_next()
+    player.adjust_audio()
+    logger.info(f"Volume changed from {old_volume*100}% to {volume*100}% - Playing: {player.playing}, Paused: {player.paused}, Queue: {len(player.queue)}")
     await interaction.response.send_message(f"Volume set to {volume * 100}%")
 
 @client.tree.command(name="speed", description="Set playback speed (0.5 to 2.0)")
@@ -184,11 +248,52 @@ async def speed(interaction: discord.Interaction, speed: float):
         await interaction.response.send_message("I'm not playing anything!")
         return
     
+    old_speed = player.speed
     player.speed = speed
-    if player.playing and not player.paused:
-        player.voice_client.stop()
-        await player.play_next()
+    player.adjust_audio()
+    logger.info(f"Speed changed from {old_speed}x to {speed}x - Playing: {player.playing}, Paused: {player.paused}, Queue: {len(player.queue)}")
     await interaction.response.send_message(f"Playback speed set to {speed}x")
+
+@client.tree.command(name="skip", description="Skip to the next audio")
+async def skip(interaction: discord.Interaction):
+    player = client.get_audio_player(interaction.guild.id)
+    if not player.voice_client:
+        await interaction.response.send_message("I'm not playing anything!")
+        return
+    
+    if player.queue:
+        player.voice_client.stop()  # This will trigger play_next
+        await interaction.response.send_message("Skipped to next track!")
+    else:
+        await interaction.response.send_message("No more tracks in queue to skip to!")
+    logger.info(f"Skip command executed - Queue length: {len(player.queue)}")
+
+@client.tree.command(name="pause", description="Pause the current audio")
+async def pause(interaction: discord.Interaction):
+    player = client.get_audio_player(interaction.guild.id)
+    if not player.voice_client or not player.playing or player.paused:
+        await interaction.response.send_message("Nothing is playing or already paused!")
+        return
+    
+    if player.voice_client.is_playing():
+        player.voice_client.pause()
+        player.paused = True
+        await interaction.response.send_message("Audio paused!")
+    else:
+        await interaction.response.send_message("Nothing is currently playing!")
+    logger.info(f"Pause command - Playing: {player.playing}, Paused: {player.paused}")
+
+@client.tree.command(name="resume", description="Resume paused audio")
+async def resume(interaction: discord.Interaction):
+    player = client.get_audio_player(interaction.guild.id)
+    if not player.voice_client or not player.paused:
+        await interaction.response.send_message("Nothing is paused!")
+        return
+    
+    player.voice_client.resume()
+    player.paused = False
+    await interaction.response.send_message("Audio resumed!")
+    logger.info(f"Resume command - Playing: {player.playing}, Paused: {player.paused}")
 
 @client.tree.command(name="stop", description="Stop audio and clear the queue")
 async def stop(interaction: discord.Interaction):
@@ -205,6 +310,7 @@ async def stop(interaction: discord.Interaction):
     await player.voice_client.disconnect()
     player.voice_client = None
     await interaction.response.send_message("Stopped audio and cleared the queue!")
+    logger.info("Stop command executed - Queue cleared")
 
 @client.event
 async def on_ready():
